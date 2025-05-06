@@ -88,7 +88,11 @@ impl TextureAtlas {
 
         // Make the top left pixel fully white for `WHITE_UV`, i.e. painting something with solid color:
         let (pos, image) = atlas.allocate((1, 1));
-        assert_eq!(pos, (0, 0));
+        assert_eq!(
+            pos,
+            (0, 0),
+            "Expected the first allocation to be at (0, 0), but was at {pos:?}"
+        );
         image[pos] = 1.0;
 
         // Allocate a series of anti-aliased discs used to render small filled circles:
@@ -159,8 +163,8 @@ impl TextureAtlas {
     }
 
     fn max_height(&self) -> usize {
-        // the initial width is likely the max texture side size
-        self.image.width()
+        // the initial width is set to the max size
+        self.image.height().max(self.image.width())
     }
 
     /// When this get high, it might be time to clear and start over!

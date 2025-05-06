@@ -4,11 +4,14 @@ use crate::{
     mutex::{Mutex, MutexGuard},
     text::{
         font::{Font, FontImpl},
-        Galley, LayoutJob,
+        Galley, LayoutJob, LayoutSection,
     },
     TextureAtlas,
 };
-use emath::NumExt as _;
+use emath::{NumExt as _, OrderedFloat};
+
+#[cfg(feature = "default_fonts")]
+use epaint_default_fonts::{EMOJI_ICON, HACK_REGULAR, NOTO_EMOJI_REGULAR, UBUNTU_LIGHT};
 
 // ----------------------------------------------------------------------------
 
@@ -51,12 +54,11 @@ impl FontId {
     }
 }
 
-#[allow(clippy::derived_hash_with_manual_eq)]
 impl std::hash::Hash for FontId {
     #[inline(always)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self { size, family } = self;
-        crate::f32_hash(state, *size);
+        emath::OrderedFloat(*size).hash(state);
         family.hash(state);
     }
 }
@@ -141,6 +143,12 @@ impl FontData {
     }
 }
 
+impl AsRef<[u8]> for FontData {
+    fn as_ref(&self) -> &[u8] {
+        self.font.as_ref()
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Extra scale and vertical tweak to apply to all text of a certain font.
@@ -156,6 +164,8 @@ pub struct FontTweak {
     /// Shift font's glyphs downwards by this fraction of the font size (in points).
     /// this is only a visual effect and does not affect the text layout.
     ///
+    /// Affects larger font sizes more.
+    ///
     /// A positive value shifts the text downwards.
     /// A negative value shifts it upwards.
     ///
@@ -164,6 +174,8 @@ pub struct FontTweak {
 
     /// Shift font's glyphs downwards by this amount of logical points.
     /// this is only a visual effect and does not affect the text layout.
+    ///
+    /// Affects all font sizes equally.
     ///
     /// Example value: `2.0`.
     pub y_offset: f32,
@@ -182,7 +194,7 @@ impl Default for FontTweak {
             scale: 1.0,
             y_offset_factor: 0.0,
             y_offset: 0.0,
-            baseline_offset_factor: -0.0333, // makes the default fonts look more centered in buttons and such
+            baseline_offset_factor: 0.0,
         }
     }
 }
@@ -217,7 +229,11 @@ fn ab_glyph_font_from_font_data(name: &str, data: &FontData) -> ab_glyph::FontAr
 ///
 /// // Install my own font (maybe supporting non-latin characters):
 /// fonts.font_data.insert("my_font".to_owned(),
-///    FontData::from_static(include_bytes!("../../fonts/Ubuntu-Light.ttf"))); // .ttf and .otf supported
+///    std::sync::Arc::new(
+///        // .ttf and .otf supported
+///        FontData::from_static(include_bytes!("../../../epaint_default_fonts/fonts/Ubuntu-Light.ttf"))
+///    )
+/// );
 ///
 /// // Put my font first (highest priority):
 /// fonts.families.get_mut(&FontFamily::Proportional).unwrap()
@@ -236,7 +252,7 @@ pub struct FontDefinitions {
     /// List of font names and their definitions.
     ///
     /// `epaint` has built-in-default for these, but you can override them if you like.
-    pub font_data: BTreeMap<String, FontData>,
+    pub font_data: BTreeMap<String, Arc<FontData>>,
 
     /// Which fonts (names) to use for each [`FontFamily`].
     ///
@@ -245,6 +261,50 @@ pub struct FontDefinitions {
     /// the first font and then move to the second, and so on.
     /// So the first font is the primary, and then comes a list of fallbacks in order of priority.
     pub families: BTreeMap<FontFamily, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FontInsert {
+    /// Font name
+    pub name: String,
+
+    /// A `.ttf` or `.otf` file and a font face index.
+    pub data: FontData,
+
+    /// Sets the font family and priority
+    pub families: Vec<InsertFontFamily>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertFontFamily {
+    /// Font family
+    pub family: FontFamily,
+
+    /// Fallback or Primary font
+    pub priority: FontPriority,
+}
+
+#[derive(Debug, Clone)]
+pub enum FontPriority {
+    /// Prefer this font before all existing ones.
+    ///
+    /// If a desired glyph exists in this font, it will be used.
+    Highest,
+
+    /// Use this font as a fallback, after all existing ones.
+    ///
+    /// This font will only be used if the glyph is not found in any of the previously installed fonts.
+    Lowest,
+}
+
+impl FontInsert {
+    pub fn new(name: &str, data: FontData, families: Vec<InsertFontFamily>) -> Self {
+        Self {
+            name: name.to_owned(),
+            data,
+            families,
+        }
+    }
 }
 
 impl Default for FontDefinitions {
@@ -259,43 +319,36 @@ impl Default for FontDefinitions {
     /// otherwise this is the same as [`Self::empty`].
     #[cfg(feature = "default_fonts")]
     fn default() -> Self {
-        let mut font_data: BTreeMap<String, FontData> = BTreeMap::new();
+        let mut font_data: BTreeMap<String, Arc<FontData>> = BTreeMap::new();
 
         let mut families = BTreeMap::new();
 
         font_data.insert(
             "Hack".to_owned(),
-            FontData::from_static(include_bytes!("../../fonts/Hack-Regular.ttf")),
-        );
-        font_data.insert(
-            "Ubuntu-Light".to_owned(),
-            FontData::from_static(include_bytes!("../../fonts/Ubuntu-Light.ttf")),
+            Arc::new(FontData::from_static(HACK_REGULAR)),
         );
 
         // Some good looking emojis. Use as first priority:
         font_data.insert(
             "NotoEmoji-Regular".to_owned(),
-            FontData::from_static(include_bytes!("../../fonts/NotoEmoji-Regular.ttf")).tweak(
-                FontTweak {
-                    scale: 0.81, // make it smaller
-                    ..Default::default()
-                },
-            ),
+            Arc::new(FontData::from_static(NOTO_EMOJI_REGULAR).tweak(FontTweak {
+                scale: 0.81, // Make smaller
+                ..Default::default()
+            })),
+        );
+
+        font_data.insert(
+            "Ubuntu-Light".to_owned(),
+            Arc::new(FontData::from_static(UBUNTU_LIGHT)),
         );
 
         // Bigger emojis, and more. <http://jslegers.github.io/emoji-icon-font/>:
         font_data.insert(
             "emoji-icon-font".to_owned(),
-            FontData::from_static(include_bytes!("../../fonts/emoji-icon-font.ttf")).tweak(
-                FontTweak {
-                    scale: 0.88, // make it smaller
-
-                    // probably not correct, but this does make texts look better (#2724 for details)
-                    y_offset_factor: 0.11, // move glyphs down to better align with common fonts
-                    baseline_offset_factor: -0.11, // ...now the entire row is a bit down so shift it back
-                    ..Default::default()
-                },
-            ),
+            Arc::new(FontData::from_static(EMOJI_ICON).tweak(FontTweak {
+                scale: 0.90, // Make smaller
+                ..Default::default()
+            })),
         );
 
         families.insert(
@@ -364,7 +417,7 @@ impl FontDefinitions {
 ///
 /// If you are using `egui`, use `egui::Context::set_fonts` and `egui::Context::fonts`.
 ///
-/// You need to call [`Self::begin_frame`] and [`Self::font_image_delta`] once every frame.
+/// You need to call [`Self::begin_pass`] and [`Self::font_image_delta`] once every frame.
 #[derive(Clone)]
 pub struct Fonts(Arc<Mutex<FontsAndCache>>);
 
@@ -393,7 +446,7 @@ impl Fonts {
     ///
     /// This function will react to changes in `pixels_per_point` and `max_texture_side`,
     /// as well as notice when the font atlas is getting full, and handle that.
-    pub fn begin_frame(&self, pixels_per_point: f32, max_texture_side: usize) {
+    pub fn begin_pass(&self, pixels_per_point: f32, max_texture_side: usize) {
         let mut fonts_and_cache = self.0.lock();
 
         let pixels_per_point_changed = fonts_and_cache.fonts.pixels_per_point != pixels_per_point;
@@ -471,7 +524,9 @@ impl Fonts {
         self.lock().fonts.has_glyphs(font_id, s)
     }
 
-    /// Height of one row of text in points
+    /// Height of one row of text in points.
+    ///
+    /// Returns a value rounded to [`emath::GUI_ROUNDING`].
     #[inline]
     pub fn row_height(&self, font_id: &FontId) -> f32 {
         self.lock().fonts.row_height(font_id)
@@ -507,7 +562,7 @@ impl Fonts {
     /// How full is the font atlas?
     ///
     /// This increases as new fonts and/or glyphs are used,
-    /// but can also decrease in a call to [`Self::begin_frame`].
+    /// but can also decrease in a call to [`Self::begin_pass`].
     pub fn font_atlas_fill_ratio(&self) -> f32 {
         self.lock().fonts.atlas.lock().fill_ratio()
     }
@@ -561,24 +616,11 @@ pub struct FontsAndCache {
 
 impl FontsAndCache {
     fn layout_job(&mut self, job: LayoutJob) -> Arc<Galley> {
-        self.galley_cache.layout(&mut self.fonts, job)
+        let allow_split_paragraphs = true; // Optimization for editing text with many paragraphs.
+        self.galley_cache
+            .layout(&mut self.fonts, job, allow_split_paragraphs)
     }
 }
-
-// ----------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HashableF32(f32);
-
-#[allow(clippy::derived_hash_with_manual_eq)]
-impl std::hash::Hash for HashableF32 {
-    #[inline(always)]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        crate::f32_hash(state, self.0);
-    }
-}
-
-impl Eq for HashableF32 {}
 
 // ----------------------------------------------------------------------------
 
@@ -591,7 +633,7 @@ pub struct FontsImpl {
     definitions: FontDefinitions,
     atlas: Arc<Mutex<TextureAtlas>>,
     font_impl_cache: FontImplCache,
-    sized_family: ahash::HashMap<(HashableF32, FontFamily), Font>,
+    sized_family: ahash::HashMap<(OrderedFloat<f32>, FontFamily), Font>,
 }
 
 impl FontsImpl {
@@ -607,7 +649,7 @@ impl FontsImpl {
             "pixels_per_point out of range: {pixels_per_point}"
         );
 
-        let texture_width = max_texture_side.at_most(8 * 1024);
+        let texture_width = max_texture_side.at_most(16 * 1024);
         let initial_height = 32; // Keep initial font atlas small, so it is fast to upload to GPU. This will expand as needed anyways.
         let atlas = TextureAtlas::new([texture_width, initial_height]);
 
@@ -638,10 +680,11 @@ impl FontsImpl {
 
     /// Get the right font implementation from size and [`FontFamily`].
     pub fn font(&mut self, font_id: &FontId) -> &mut Font {
-        let FontId { size, family } = font_id;
+        let FontId { mut size, family } = font_id;
+        size = size.at_least(0.1).at_most(2048.0);
 
         self.sized_family
-            .entry((HashableF32(*size), family.clone()))
+            .entry((OrderedFloat(size), family.clone()))
             .or_insert_with(|| {
                 let fonts = &self.definitions.families.get(family);
                 let fonts = fonts
@@ -649,7 +692,7 @@ impl FontsImpl {
 
                 let fonts: Vec<Arc<FontImpl>> = fonts
                     .iter()
-                    .map(|font_name| self.font_impl_cache.font_impl(*size, font_name))
+                    .map(|font_name| self.font_impl_cache.font_impl(size, font_name))
                     .collect();
 
                 Font::new(fonts)
@@ -672,6 +715,8 @@ impl FontsImpl {
     }
 
     /// Height of one row of text in points.
+    ///
+    /// Returns a value rounded to [`emath::GUI_ROUNDING`].
     fn row_height(&mut self, font_id: &FontId) -> f32 {
         self.font(font_id).row_height()
     }
@@ -682,6 +727,12 @@ impl FontsImpl {
 struct CachedGalley {
     /// When it was last used
     last_used: u32,
+
+    /// Hashes of all other entries this one depends on for quick re-layout.
+    /// Their `last_used`s should be updated alongside this one to make sure they're
+    /// not evicted.
+    children: Option<Arc<[u64]>>,
+
     galley: Arc<Galley>,
 }
 
@@ -693,25 +744,209 @@ struct GalleyCache {
 }
 
 impl GalleyCache {
-    fn layout(&mut self, fonts: &mut FontsImpl, job: LayoutJob) -> Arc<Galley> {
+    fn layout_internal(
+        &mut self,
+        fonts: &mut FontsImpl,
+        mut job: LayoutJob,
+        allow_split_paragraphs: bool,
+    ) -> (u64, Arc<Galley>) {
+        if job.wrap.max_width.is_finite() {
+            // Protect against rounding errors in egui layout code.
+
+            // Say the user asks to wrap at width 200.0.
+            // The text layout wraps, and reports that the final width was 196.0 points.
+            // This then trickles up the `Ui` chain and gets stored as the width for a tooltip (say).
+            // On the next frame, this is then set as the max width for the tooltip,
+            // and we end up calling the text layout code again, this time with a wrap width of 196.0.
+            // Except, somewhere in the `Ui` chain with added margins etc, a rounding error was introduced,
+            // so that we actually set a wrap-width of 195.9997 instead.
+            // Now the text that fit perfrectly at 196.0 needs to wrap one word earlier,
+            // and so the text re-wraps and reports a new width of 185.0 points.
+            // And then the cycle continues.
+
+            // So we limit max_width to integers.
+
+            // Related issues:
+            // * https://github.com/emilk/egui/issues/4927
+            // * https://github.com/emilk/egui/issues/4928
+            // * https://github.com/emilk/egui/issues/5084
+            // * https://github.com/emilk/egui/issues/5163
+
+            job.wrap.max_width = job.wrap.max_width.round();
+        }
+
         let hash = crate::util::hash(&job); // TODO(emilk): even faster hasher?
 
-        match self.cache.entry(hash) {
+        let galley = match self.cache.entry(hash) {
             std::collections::hash_map::Entry::Occupied(entry) => {
+                // The job was found in cache - no need to re-layout.
                 let cached = entry.into_mut();
                 cached.last_used = self.generation;
-                cached.galley.clone()
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let galley = super::layout(fonts, job.into());
-                let galley = Arc::new(galley);
-                entry.insert(CachedGalley {
-                    last_used: self.generation,
-                    galley: galley.clone(),
-                });
+
+                let galley = cached.galley.clone();
+                if let Some(children) = &cached.children {
+                    // The point of `allow_split_paragraphs` is to split large jobs into paragraph,
+                    // and then cache each paragraph individually.
+                    // That way, if we edit a single paragraph, only that paragraph will be re-layouted.
+                    // For that to work we need to keep all the child/paragraph
+                    // galleys alive while the parent galley is alive:
+                    for child_hash in children.clone().iter() {
+                        if let Some(cached_child) = self.cache.get_mut(child_hash) {
+                            cached_child.last_used = self.generation;
+                        }
+                    }
+                }
+
                 galley
             }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let job = Arc::new(job);
+                if allow_split_paragraphs && should_cache_each_paragraph_individually(&job) {
+                    let (child_galleys, child_hashes) =
+                        self.layout_each_paragraph_individuallly(fonts, &job);
+                    debug_assert_eq!(
+                        child_hashes.len(),
+                        child_galleys.len(),
+                        "Bug in `layout_each_paragraph_individuallly`"
+                    );
+                    let galley =
+                        Arc::new(Galley::concat(job, &child_galleys, fonts.pixels_per_point));
+
+                    self.cache.insert(
+                        hash,
+                        CachedGalley {
+                            last_used: self.generation,
+                            children: Some(child_hashes.into()),
+                            galley: galley.clone(),
+                        },
+                    );
+                    galley
+                } else {
+                    let galley = super::layout(fonts, job);
+                    let galley = Arc::new(galley);
+                    entry.insert(CachedGalley {
+                        last_used: self.generation,
+                        children: None,
+                        galley: galley.clone(),
+                    });
+                    galley
+                }
+            }
+        };
+
+        (hash, galley)
+    }
+
+    fn layout(
+        &mut self,
+        fonts: &mut FontsImpl,
+        job: LayoutJob,
+        allow_split_paragraphs: bool,
+    ) -> Arc<Galley> {
+        self.layout_internal(fonts, job, allow_split_paragraphs).1
+    }
+
+    /// Split on `\n` and lay out (and cache) each paragraph individually.
+    fn layout_each_paragraph_individuallly(
+        &mut self,
+        fonts: &mut FontsImpl,
+        job: &LayoutJob,
+    ) -> (Vec<Arc<Galley>>, Vec<u64>) {
+        profiling::function_scope!();
+
+        let mut current_section = 0;
+        let mut start = 0;
+        let mut max_rows_remaining = job.wrap.max_rows;
+        let mut child_galleys = Vec::new();
+        let mut child_hashes = Vec::new();
+
+        while start < job.text.len() {
+            let is_first_paragraph = start == 0;
+            let end = job.text[start..]
+                .find('\n')
+                .map_or(job.text.len(), |i| start + i + 1);
+
+            let mut paragraph_job = LayoutJob {
+                text: job.text[start..end].to_owned(),
+                wrap: crate::text::TextWrapping {
+                    max_rows: max_rows_remaining,
+                    ..job.wrap
+                },
+                sections: Vec::new(),
+                break_on_newline: job.break_on_newline,
+                halign: job.halign,
+                justify: job.justify,
+                first_row_min_height: if is_first_paragraph {
+                    job.first_row_min_height
+                } else {
+                    0.0
+                },
+                round_output_to_gui: job.round_output_to_gui,
+            };
+
+            // Add overlapping sections:
+            for section in &job.sections[current_section..job.sections.len()] {
+                let LayoutSection {
+                    leading_space,
+                    byte_range: section_range,
+                    format,
+                } = section;
+
+                // `start` and `end` are the byte range of the current paragraph.
+                // How does the current section overlap with the paragraph range?
+
+                if section_range.end <= start {
+                    // The section is behind us
+                    current_section += 1;
+                } else if end <= section_range.start {
+                    break; // Haven't reached this one yet.
+                } else {
+                    // Section range overlaps with paragraph range
+                    debug_assert!(
+                        section_range.start < section_range.end,
+                        "Bad byte_range: {section_range:?}"
+                    );
+                    let new_range = section_range.start.saturating_sub(start)
+                        ..(section_range.end.at_most(end)).saturating_sub(start);
+                    debug_assert!(
+                        new_range.start <= new_range.end,
+                        "Bad new section range: {new_range:?}"
+                    );
+                    paragraph_job.sections.push(LayoutSection {
+                        leading_space: if start <= new_range.start {
+                            *leading_space
+                        } else {
+                            0.0
+                        },
+                        byte_range: new_range,
+                        format: format.clone(),
+                    });
+                }
+            }
+
+            // TODO(emilk): we could lay out each paragraph in parallel to get a nice speedup on multicore machines.
+            let (hash, galley) = self.layout_internal(fonts, paragraph_job, false);
+            child_hashes.push(hash);
+
+            // This will prevent us from invalidating cache entries unnecessarily:
+            if max_rows_remaining != usize::MAX {
+                max_rows_remaining -= galley.rows.len();
+                // Ignore extra trailing row, see merging `Galley::concat` for more details.
+                if end < job.text.len() && !galley.elided {
+                    max_rows_remaining += 1;
+                }
+            }
+
+            let elided = galley.elided;
+            child_galleys.push(galley);
+            if elided {
+                break;
+            }
+
+            start = end;
         }
+
+        (child_galleys, child_hashes)
     }
 
     pub fn num_galleys_in_cache(&self) -> usize {
@@ -726,6 +961,16 @@ impl GalleyCache {
         });
         self.generation = self.generation.wrapping_add(1);
     }
+}
+
+/// If true, lay out and cache each paragraph (sections separated by newlines) individually.
+///
+/// This makes it much faster to re-layout the full text when only a portion of it has changed since last frame, i.e. when editing somewhere in a file with thousands of lines/paragraphs.
+fn should_cache_each_paragraph_individually(job: &LayoutJob) -> bool {
+    // We currently don't support this elided text, i.e. when `max_rows` is set.
+    // Most often, elided text is elided to one row,
+    // and so will always be fast to lay out.
+    job.break_on_newline && job.wrap.max_rows == usize::MAX && job.text.contains('\n')
 }
 
 // ----------------------------------------------------------------------------
@@ -743,7 +988,7 @@ impl FontImplCache {
     pub fn new(
         atlas: Arc<Mutex<TextureAtlas>>,
         pixels_per_point: f32,
-        font_data: &BTreeMap<String, FontData>,
+        font_data: &BTreeMap<String, Arc<FontData>>,
     ) -> Self {
         let ab_glyph_fonts = font_data
             .iter()
@@ -796,5 +1041,123 @@ impl FontImplCache {
                 ))
             })
             .clone()
+    }
+}
+
+#[cfg(feature = "default_fonts")]
+#[cfg(test)]
+mod tests {
+    use core::f32;
+
+    use super::*;
+    use crate::{text::TextFormat, Stroke};
+    use ecolor::Color32;
+    use emath::Align;
+
+    fn jobs() -> Vec<LayoutJob> {
+        vec![
+            LayoutJob::simple(
+                String::default(),
+                FontId::new(14.0, FontFamily::Monospace),
+                Color32::WHITE,
+                f32::INFINITY,
+            ),
+            LayoutJob::simple(
+                "Simple test.".to_owned(),
+                FontId::new(14.0, FontFamily::Monospace),
+                Color32::WHITE,
+                f32::INFINITY,
+            ),
+            LayoutJob::simple(
+                "This some text that may be long.\nDet kanske också finns lite ÅÄÖ här.".to_owned(),
+                FontId::new(14.0, FontFamily::Proportional),
+                Color32::WHITE,
+                50.0,
+            ),
+            {
+                let mut job = LayoutJob {
+                    first_row_min_height: 20.0,
+                    ..Default::default()
+                };
+                job.append(
+                    "1st paragraph has some leading space.\n",
+                    16.0,
+                    TextFormat {
+                        font_id: FontId::new(14.0, FontFamily::Proportional),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    "2nd paragraph has underline and strikthrough, and has some non-ASCII characters:\n ÅÄÖ.",
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::new(15.0, FontFamily::Monospace),
+                        underline: Stroke::new(1.0, Color32::RED),
+                        strikethrough: Stroke::new(1.0, Color32::GREEN),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    "3rd paragraph is kind of boring, but has italics.\nAnd a newline",
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::new(10.0, FontFamily::Proportional),
+                        italics: true,
+                        ..Default::default()
+                    },
+                );
+
+                job
+            },
+        ]
+    }
+
+    #[test]
+    fn test_split_paragraphs() {
+        for pixels_per_point in [1.0, 2.0_f32.sqrt(), 2.0] {
+            let max_texture_side = 4096;
+            let mut fonts = FontsImpl::new(
+                pixels_per_point,
+                max_texture_side,
+                FontDefinitions::default(),
+            );
+
+            for halign in [Align::Min, Align::Center, Align::Max] {
+                for justify in [false, true] {
+                    for mut job in jobs() {
+                        job.halign = halign;
+                        job.justify = justify;
+
+                        let whole = GalleyCache::default().layout(&mut fonts, job.clone(), false);
+
+                        let split = GalleyCache::default().layout(&mut fonts, job.clone(), true);
+
+                        for (i, row) in whole.rows.iter().enumerate() {
+                            println!(
+                                "Whole row {i}: section_index_at_start={}, first glyph section_index: {:?}",
+                                row.row.section_index_at_start,
+                                row.row.glyphs.first().map(|g| g.section_index)
+                            );
+                        }
+                        for (i, row) in split.rows.iter().enumerate() {
+                            println!(
+                                "Split row {i}: section_index_at_start={}, first glyph section_index: {:?}",
+                                row.row.section_index_at_start,
+                                row.row.glyphs.first().map(|g| g.section_index)
+                            );
+                        }
+
+                        // Don't compare for equaliity; but format with a specific precision and make sure we hit that.
+                        // NOTE: we use a rather low precision, because as long as we're within a pixel I think it's good enough.
+                        similar_asserts::assert_eq!(
+                            format!("{:#.1?}", split),
+                            format!("{:#.1?}", whole),
+                            "pixels_per_point: {pixels_per_point:.2}, input text: '{}'",
+                            job.text
+                        );
+                    }
+                }
+            }
+        }
     }
 }

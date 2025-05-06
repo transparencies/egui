@@ -19,7 +19,7 @@
 //! ### Deferred viewports
 //! These are created with [`Context::show_viewport_deferred`].
 //! Deferred viewports take a closure that is called by the integration at a later time, perhaps multiple times.
-//! Deferred viewports are repainted independenantly of the parent viewport.
+//! Deferred viewports are repainted independently of the parent viewport.
 //! This means communication with them needs to be done via channels, or `Arc/Mutex`.
 //!
 //! This is the most performant type of child viewport, though a bit more cumbersome to work with compared to immediate viewports.
@@ -188,7 +188,7 @@ impl std::fmt::Debug for IconData {
 
 impl From<IconData> for epaint::ColorImage {
     fn from(icon: IconData) -> Self {
-        crate::profile_function!();
+        profiling::function_scope!();
         let IconData {
             rgba,
             width,
@@ -200,7 +200,7 @@ impl From<IconData> for epaint::ColorImage {
 
 impl From<&IconData> for epaint::ColorImage {
     fn from(icon: &IconData) -> Self {
-        crate::profile_function!();
+        profiling::function_scope!();
         let IconData {
             rgba,
             width,
@@ -260,7 +260,6 @@ pub type ImmediateViewportRendererCallback = dyn for<'a> Fn(&Context, ImmediateV
 /// The default values are implementation defined, so you may want to explicitly
 /// configure the size of the window, and what buttons are shown.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(clippy::option_option)]
 pub struct ViewportBuilder {
     /// The title of the viewport.
     /// `eframe` will use this as the title of the native window.
@@ -275,6 +274,11 @@ pub struct ViewportBuilder {
     pub min_inner_size: Option<Vec2>,
     pub max_inner_size: Option<Vec2>,
 
+    /// Whether clamp the window's size to monitor's size. The default is `true` on linux, otherwise it is `false`.
+    ///
+    /// Note: On some Linux systems, a window size larger than the monitor causes crashes
+    pub clamp_size_to_monitor_size: Option<bool>,
+
     pub fullscreen: Option<bool>,
     pub maximized: Option<bool>,
     pub resizable: Option<bool>,
@@ -286,9 +290,11 @@ pub struct ViewportBuilder {
 
     // macOS:
     pub fullsize_content_view: Option<bool>,
+    pub movable_by_window_background: Option<bool>,
     pub title_shown: Option<bool>,
     pub titlebar_buttons_shown: Option<bool>,
     pub titlebar_shown: Option<bool>,
+    pub has_shadow: Option<bool>,
 
     // windows:
     pub drag_and_drop: Option<bool>,
@@ -301,6 +307,9 @@ pub struct ViewportBuilder {
     pub window_level: Option<WindowLevel>,
 
     pub mouse_passthrough: Option<bool>,
+
+    // X11
+    pub window_type: Option<X11WindowType>,
 }
 
 impl ViewportBuilder {
@@ -372,6 +381,10 @@ impl ViewportBuilder {
     /// The default is `false`.
     /// If this is not working, it's because the graphic context doesn't support transparency,
     /// you will need to set the transparency in the eframe!
+    ///
+    /// ## Platform-specific
+    ///
+    /// **macOS:** When using this feature to create an overlay-like UI, you likely want to combine this with [`Self::with_has_shadow`] set to `false` in order to avoid ghosting artifacts.
     #[inline]
     pub fn with_transparent(mut self, transparent: bool) -> Self {
         self.transparent = Some(transparent);
@@ -381,7 +394,7 @@ impl ViewportBuilder {
     /// The application icon, e.g. in the Windows task bar or the alt-tab menu.
     ///
     /// The default icon is a white `e` on a black background (for "egui" or "eframe").
-    /// If you prefer the OS default, set this to `None`.
+    /// If you prefer the OS default, set this to `IconData::default()`.
     #[inline]
     pub fn with_icon(mut self, icon: impl Into<Arc<IconData>>) -> Self {
         self.icon = Some(icon.into());
@@ -424,6 +437,14 @@ impl ViewportBuilder {
         self
     }
 
+    /// macOS: Set to `true` to allow the window to be moved by dragging the background.
+    /// Enabling this feature can result in unexpected behaviour with draggable UI widgets such as sliders.
+    #[inline]
+    pub fn with_movable_by_background(mut self, value: bool) -> Self {
+        self.movable_by_window_background = Some(value);
+        self
+    }
+
     /// macOS: Set to `false` to hide the window title.
     #[inline]
     pub fn with_title_shown(mut self, title_shown: bool) -> Self {
@@ -442,6 +463,19 @@ impl ViewportBuilder {
     #[inline]
     pub fn with_titlebar_shown(mut self, shown: bool) -> Self {
         self.titlebar_shown = Some(shown);
+        self
+    }
+
+    /// macOS: Set to `false` to make the window render without a drop shadow.
+    ///
+    /// The default is `true`.
+    ///
+    /// Disabling this feature can solve ghosting issues experienced if using [`Self::with_transparent`].
+    ///
+    /// Look at winit for more details
+    #[inline]
+    pub fn with_has_shadow(mut self, has_shadow: bool) -> Self {
+        self.has_shadow = Some(has_shadow);
         self
     }
 
@@ -490,6 +524,15 @@ impl ViewportBuilder {
         self
     }
 
+    /// Sets whether clamp the window's size to monitor's size. The default is `true` on linux, otherwise it is `false`.
+    ///
+    /// Note: On some Linux systems, a window size larger than the monitor causes crashes
+    #[inline]
+    pub fn with_clamp_size_to_monitor_size(mut self, value: bool) -> Self {
+        self.clamp_size_to_monitor_size = Some(value);
+        self
+    }
+
     /// Does not work on X11.
     #[inline]
     pub fn with_close_button(mut self, value: bool) -> Self {
@@ -517,7 +560,7 @@ impl ViewportBuilder {
     /// See [winit's documentation][drag_and_drop] for information on why you
     /// might want to disable this on windows.
     ///
-    /// [drag_and_drop]: https://docs.rs/winit/latest/x86_64-pc-windows-msvc/winit/platform/windows/trait.WindowBuilderExtWindows.html#tymethod.with_drag_and_drop
+    /// [drag_and_drop]: https://docs.rs/winit/latest/x86_64-pc-windows-msvc/winit/platform/windows/trait.WindowAttributesExtWindows.html#tymethod.with_drag_and_drop
     #[inline]
     pub fn with_drag_and_drop(mut self, value: bool) -> Self {
         self.drag_and_drop = Some(value);
@@ -526,6 +569,15 @@ impl ViewportBuilder {
 
     /// The initial "outer" position of the window,
     /// i.e. where the top-left corner of the frame/chrome should be.
+    ///
+    /// **`eframe` notes**:
+    ///
+    /// - **iOS:** Sets the top left coordinates of the window in the screen space coordinate system.
+    /// - **Web:** Sets the top-left coordinates relative to the viewport. Doesn't account for CSS
+    ///   [`transform`].
+    /// - **Android / Wayland:** Unsupported.
+    ///
+    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
     #[inline]
     pub fn with_position(mut self, pos: impl Into<Pos2>) -> Self {
         self.position = Some(pos.into());
@@ -583,6 +635,15 @@ impl ViewportBuilder {
         self
     }
 
+    /// ### On X11
+    /// This sets the window type.
+    /// Maps directly to [`_NET_WM_WINDOW_TYPE`](https://specifications.freedesktop.org/wm-spec/wm-spec-1.5.html).
+    #[inline]
+    pub fn with_window_type(mut self, value: X11WindowType) -> Self {
+        self.window_type = Some(value);
+        self
+    }
+
     /// Update this `ViewportBuilder` with a delta,
     /// returning a list of commands and a bool indicating if the window needs to be recreated.
     #[must_use]
@@ -594,6 +655,7 @@ impl ViewportBuilder {
             inner_size: new_inner_size,
             min_inner_size: new_min_inner_size,
             max_inner_size: new_max_inner_size,
+            clamp_size_to_monitor_size: new_clamp_size_to_monitor_size,
             fullscreen: new_fullscreen,
             maximized: new_maximized,
             resizable: new_resizable,
@@ -604,15 +666,18 @@ impl ViewportBuilder {
             visible: new_visible,
             drag_and_drop: new_drag_and_drop,
             fullsize_content_view: new_fullsize_content_view,
+            movable_by_window_background: new_movable_by_window_background,
             title_shown: new_title_shown,
             titlebar_buttons_shown: new_titlebar_buttons_shown,
             titlebar_shown: new_titlebar_shown,
+            has_shadow: new_has_shadow,
             close_button: new_close_button,
             minimize_button: new_minimize_button,
             maximize_button: new_maximize_button,
             window_level: new_window_level,
             mouse_passthrough: new_mouse_passthrough,
             taskbar: new_taskbar,
+            window_type: new_window_type,
         } = new_vp_builder;
 
         let mut commands = Vec::new();
@@ -700,7 +765,7 @@ impl ViewportBuilder {
         }
 
         if let Some(new_visible) = new_visible {
-            if Some(new_visible) != self.active {
+            if Some(new_visible) != self.visible {
                 self.visible = Some(new_visible);
                 commands.push(ViewportCommand::Visible(new_visible));
             }
@@ -726,6 +791,13 @@ impl ViewportBuilder {
         // changing them without recreating the window.
 
         let mut recreate_window = false;
+
+        if new_clamp_size_to_monitor_size.is_some()
+            && self.clamp_size_to_monitor_size != new_clamp_size_to_monitor_size
+        {
+            self.clamp_size_to_monitor_size = new_clamp_size_to_monitor_size;
+            recreate_window = true;
+        }
 
         if new_active.is_some() && self.active != new_active {
             self.active = new_active;
@@ -769,6 +841,11 @@ impl ViewportBuilder {
             recreate_window = true;
         }
 
+        if new_has_shadow.is_some() && self.has_shadow != new_has_shadow {
+            self.has_shadow = new_has_shadow;
+            recreate_window = true;
+        }
+
         if new_taskbar.is_some() && self.taskbar != new_taskbar {
             self.taskbar = new_taskbar;
             recreate_window = true;
@@ -781,8 +858,20 @@ impl ViewportBuilder {
             recreate_window = true;
         }
 
+        if new_movable_by_window_background.is_some()
+            && self.movable_by_window_background != new_movable_by_window_background
+        {
+            self.movable_by_window_background = new_movable_by_window_background;
+            recreate_window = true;
+        }
+
         if new_drag_and_drop.is_some() && self.drag_and_drop != new_drag_and_drop {
             self.drag_and_drop = new_drag_and_drop;
+            recreate_window = true;
+        }
+
+        if new_window_type.is_some() && self.window_type != new_window_type {
+            self.window_type = new_window_type;
             recreate_window = true;
         }
 
@@ -797,6 +886,61 @@ pub enum WindowLevel {
     Normal,
     AlwaysOnBottom,
     AlwaysOnTop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum X11WindowType {
+    /// This is a normal, top-level window.
+    #[default]
+    Normal,
+
+    /// A desktop feature. This can include a single window containing desktop icons with the same dimensions as the
+    /// screen, allowing the desktop environment to have full control of the desktop, without the need for proxying
+    /// root window clicks.
+    Desktop,
+
+    /// A dock or panel feature. Typically a Window Manager would keep such windows on top of all other windows.
+    Dock,
+
+    /// Toolbar windows. "Torn off" from the main application.
+    Toolbar,
+
+    /// Pinnable menu windows. "Torn off" from the main application.
+    Menu,
+
+    /// A small persistent utility window, such as a palette or toolbox.
+    Utility,
+
+    /// The window is a splash screen displayed as an application is starting up.
+    Splash,
+
+    /// This is a dialog window.
+    Dialog,
+
+    /// A dropdown menu that usually appears when the user clicks on an item in a menu bar.
+    /// This property is typically used on override-redirect windows.
+    DropdownMenu,
+
+    /// A popup menu that usually appears when the user right clicks on an object.
+    /// This property is typically used on override-redirect windows.
+    PopupMenu,
+
+    /// A tooltip window. Usually used to show additional information when hovering over an object with the cursor.
+    /// This property is typically used on override-redirect windows.
+    Tooltip,
+
+    /// The window is a notification.
+    /// This property is typically used on override-redirect windows.
+    Notification,
+
+    /// This should be used on the windows that are popped up by combo boxes.
+    /// This property is typically used on override-redirect windows.
+    Combo,
+
+    /// This indicates the window is being dragged.
+    /// This property is typically used on override-redirect windows.
+    Dnd,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -841,13 +985,16 @@ pub enum ResizeDirection {
 
 /// An output [viewport](crate::viewport)-command from egui to the backend, e.g. to change the window title or size.
 ///
-///  You can send a [`ViewportCommand`] to the viewport with [`Context::send_viewport_cmd`].
+/// You can send a [`ViewportCommand`] to the viewport with [`Context::send_viewport_cmd`].
 ///
 /// See [`crate::viewport`] for how to build new viewports (native windows).
 ///
 /// All coordinates are in logical points.
 ///
-/// This is essentially a way to diff [`ViewportBuilder`].
+/// [`ViewportCommand`] is essentially a way to diff [`ViewportBuilder`]s.
+///
+/// Only commands specific to a viewport are part of [`ViewportCommand`].
+/// Other commands should be put in [`crate::OutputCommand`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum ViewportCommand {
@@ -920,7 +1067,7 @@ pub enum ViewportCommand {
     /// Set window to be always-on-top, always-on-bottom, or neither.
     WindowLevel(WindowLevel),
 
-    /// The the window icon.
+    /// The window icon.
     Icon(Option<Arc<IconData>>),
 
     /// Set the IME cursor editing area.
@@ -961,10 +1108,25 @@ pub enum ViewportCommand {
     /// Enable mouse pass-through: mouse clicks pass through the window, used for non-interactable overlays.
     MousePassthrough(bool),
 
-    /// Take a screenshot.
+    /// Take a screenshot of the next frame after this.
     ///
-    /// The results are returned in `crate::Event::Screenshot`.
-    Screenshot,
+    /// The results are returned in [`crate::Event::Screenshot`].
+    Screenshot(crate::UserData),
+
+    /// Request cut of the current selection
+    ///
+    /// This is equivalent to the system keyboard shortcut for cut (e.g. CTRL + X).
+    RequestCut,
+
+    /// Request a copy of the current selection.
+    ///
+    /// This is equivalent to the system keyboard shortcut for copy (e.g. CTRL + C).
+    RequestCopy,
+
+    /// Request a paste from the clipboard to the current focused `TextEdit` if any.
+    ///
+    /// This is equivalent to the system keyboard shortcut for paste (e.g. CTRL + V).
+    RequestPaste,
 }
 
 impl ViewportCommand {
@@ -989,6 +1151,8 @@ impl ViewportCommand {
         self == &Self::Close
     }
 }
+
+// ----------------------------------------------------------------------------
 
 /// Describes a viewport, i.e. a native window.
 ///
@@ -1058,5 +1222,5 @@ pub struct ImmediateViewport<'a> {
     pub builder: ViewportBuilder,
 
     /// The user-code that shows the GUI.
-    pub viewport_ui_cb: Box<dyn FnOnce(&Context) + 'a>,
+    pub viewport_ui_cb: Box<dyn FnMut(&Context) + 'a>,
 }

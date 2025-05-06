@@ -23,7 +23,7 @@ use static_assertions::assert_not_impl_any;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu"))]
-pub use winit::{event_loop::EventLoopBuilder, window::WindowBuilder};
+pub use winit::{event_loop::EventLoopBuilder, window::WindowAttributes};
 
 /// Hook into the building of an event loop before it is run
 ///
@@ -41,17 +41,20 @@ pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)
 #[cfg(any(feature = "glow", feature = "wgpu"))]
 pub type WindowBuilderHook = Box<dyn FnOnce(egui::ViewportBuilder) -> egui::ViewportBuilder>;
 
+type DynError = Box<dyn std::error::Error + Send + Sync>;
+
 /// This is how your app is created.
 ///
 /// You can use the [`CreationContext`] to setup egui, restore state, setup OpenGL things, etc.
-pub type AppCreator = Box<dyn FnOnce(&CreationContext<'_>) -> Box<dyn App>>;
+pub type AppCreator<'app> =
+    Box<dyn 'app + FnOnce(&CreationContext<'_>) -> Result<Box<dyn 'app + App>, DynError>>;
 
 /// Data that is passed to [`AppCreator`] that can be used to setup and initialize your app.
 pub struct CreationContext<'s> {
     /// The egui Context.
     ///
     /// You can use this to customize the look of egui, e.g to call [`egui::Context::set_fonts`],
-    /// [`egui::Context::set_visuals`] etc.
+    /// [`egui::Context::set_visuals_of`] etc.
     pub egui_ctx: egui::Context,
 
     /// Information about the surrounding environment.
@@ -66,6 +69,10 @@ pub struct CreationContext<'s> {
     /// Only available when compiling with the `glow` feature and using [`Renderer::Glow`].
     #[cfg(feature = "glow")]
     pub gl: Option<std::sync::Arc<glow::Context>>,
+
+    /// The `get_proc_address` wrapper of underlying GL context
+    #[cfg(feature = "glow")]
+    pub get_proc_address: Option<&'s dyn Fn(&std::ffi::CStr) -> *const std::ffi::c_void>,
 
     /// The underlying WGPU render state.
     ///
@@ -84,7 +91,7 @@ pub struct CreationContext<'s> {
     pub(crate) raw_display_handle: Result<RawDisplayHandle, HandleError>,
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 #[cfg(not(target_arch = "wasm32"))]
 impl HasWindowHandle for CreationContext<'_> {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
@@ -93,12 +100,34 @@ impl HasWindowHandle for CreationContext<'_> {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 #[cfg(not(target_arch = "wasm32"))]
 impl HasDisplayHandle for CreationContext<'_> {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
         // Safety: the lifetime is correct.
         unsafe { Ok(DisplayHandle::borrow_raw(self.raw_display_handle.clone()?)) }
+    }
+}
+
+impl CreationContext<'_> {
+    /// Create a new empty [CreationContext] for testing [App]s in kittest.
+    #[doc(hidden)]
+    pub fn _new_kittest(egui_ctx: egui::Context) -> Self {
+        Self {
+            egui_ctx,
+            integration_info: IntegrationInfo::mock(),
+            storage: None,
+            #[cfg(feature = "glow")]
+            gl: None,
+            #[cfg(feature = "glow")]
+            get_proc_address: None,
+            #[cfg(feature = "wgpu")]
+            wgpu_render_state: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            raw_window_handle: Err(HandleError::NotSupported),
+            #[cfg(not(target_arch = "wasm32"))]
+            raw_display_handle: Err(HandleError::NotSupported),
+        }
     }
 }
 
@@ -146,6 +175,7 @@ pub trait App {
     /// On web the state is stored to "Local Storage".
     ///
     /// On native the path is picked using [`crate::storage_dir`].
+    /// The path can be customized via [`NativeOptions::persistence_path`].
     fn save(&mut self, _storage: &mut dyn Storage) {}
 
     /// Called once on shutdown, after [`Self::save`].
@@ -196,6 +226,24 @@ pub trait App {
     fn persist_egui_memory(&self) -> bool {
         true
     }
+
+    /// A hook for manipulating or filtering raw input before it is processed by [`Self::update`].
+    ///
+    /// This function provides a way to modify or filter input events before they are processed by egui.
+    ///
+    /// It can be used to prevent specific keyboard shortcuts or mouse events from being processed by egui.
+    ///
+    /// Additionally, it can be used to inject custom keyboard or mouse events into the input stream, which can be useful for implementing features like a virtual keyboard.
+    ///
+    /// # Arguments
+    ///
+    /// * `_ctx` - The context of the egui, which provides access to the current state of the egui.
+    /// * `_raw_input` - The raw input events that are about to be processed. This can be modified to change the input that egui processes.
+    ///
+    /// # Note
+    ///
+    /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
 }
 
 /// Selects the level of hardware graphics acceleration.
@@ -210,7 +258,7 @@ pub enum HardwareAcceleration {
 
     /// Do NOT use graphics acceleration.
     ///
-    /// On some platforms (MacOS) this is ignored and treated the same as [`Self::Preferred`].
+    /// On some platforms (macOS) this is ignored and treated the same as [`Self::Preferred`].
     Off,
 }
 
@@ -272,21 +320,6 @@ pub struct NativeOptions {
     #[cfg(any(feature = "glow", feature = "wgpu"))]
     pub renderer: Renderer,
 
-    /// Try to detect and follow the system preferred setting for dark vs light mode.
-    ///
-    /// The theme will automatically change when the dark vs light mode preference is changed.
-    ///
-    /// Does not work on Linux (see <https://github.com/rust-windowing/winit/issues/1549>).
-    ///
-    /// See also [`Self::default_theme`].
-    pub follow_system_theme: bool,
-
-    /// Which theme to use in case [`Self::follow_system_theme`] is `false`
-    /// or eframe fails to detect the system theme.
-    ///
-    /// Default: [`Theme::Dark`].
-    pub default_theme: Theme,
-
     /// This controls what happens when you close the main eframe window.
     ///
     /// If `true`, execution will continue after the eframe window is closed.
@@ -340,6 +373,29 @@ pub struct NativeOptions {
     /// Controls whether or not the native window position and size will be
     /// persisted (only if the "persistence" feature is enabled).
     pub persist_window: bool,
+
+    /// The folder where `eframe` will store the app state. If not set, eframe will use a default
+    /// data storage path for each target system.
+    pub persistence_path: Option<std::path::PathBuf>,
+
+    /// Controls whether to apply dithering to minimize banding artifacts.
+    ///
+    /// Dithering assumes an sRGB output and thus will apply noise to any input value that lies between
+    /// two 8bit values after applying the sRGB OETF function, i.e. if it's not a whole 8bit value in "gamma space".
+    /// This means that only inputs from texture interpolation and vertex colors should be affected in practice.
+    ///
+    /// Defaults to true.
+    pub dithering: bool,
+
+    /// Android application for `winit`'s event loop.
+    ///
+    /// This value is required on Android to correctly create the event loop. See
+    /// [`EventLoopBuilder::build`] and [`with_android_app`] for details.
+    ///
+    /// [`EventLoopBuilder::build`]: winit::event_loop::EventLoopBuilder::build
+    /// [`with_android_app`]: winit::platform::android::EventLoopBuilderExtAndroid::with_android_app
+    #[cfg(target_os = "android")]
+    pub android_app: Option<winit::platform::android::activity::AndroidApp>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -356,6 +412,11 @@ impl Clone for NativeOptions {
 
             #[cfg(feature = "wgpu")]
             wgpu_options: self.wgpu_options.clone(),
+
+            persistence_path: self.persistence_path.clone(),
+
+            #[cfg(target_os = "android")]
+            android_app: self.android_app.clone(),
 
             ..*self
         }
@@ -377,8 +438,6 @@ impl Default for NativeOptions {
             #[cfg(any(feature = "glow", feature = "wgpu"))]
             renderer: Renderer::default(),
 
-            follow_system_theme: cfg!(target_os = "macos") || cfg!(target_os = "windows"),
-            default_theme: Theme::Dark,
             run_and_return: true,
 
             #[cfg(any(feature = "glow", feature = "wgpu"))]
@@ -396,6 +455,13 @@ impl Default for NativeOptions {
             wgpu_options: egui_wgpu::WgpuConfiguration::default(),
 
             persist_window: true,
+
+            persistence_path: None,
+
+            dithering: true,
+
+            #[cfg(target_os = "android")]
+            android_app: None,
         }
     }
 }
@@ -405,26 +471,13 @@ impl Default for NativeOptions {
 /// Options when using `eframe` in a web page.
 #[cfg(target_arch = "wasm32")]
 pub struct WebOptions {
-    /// Try to detect and follow the system preferred setting for dark vs light mode.
-    ///
-    /// See also [`Self::default_theme`].
-    ///
-    /// Default: `true`.
-    pub follow_system_theme: bool,
-
-    /// Which theme to use in case [`Self::follow_system_theme`] is `false`
-    /// or system theme detection fails.
-    ///
-    /// Default: `Theme::Dark`.
-    pub default_theme: Theme,
-
     /// Sets the number of bits in the depth buffer.
     ///
     /// `egui` doesn't need the depth buffer, so the default value is 0.
     /// Unused by webgl context as of writing.
     pub depth_buffer: u8,
 
-    /// Which version of WebGl context to select
+    /// Which version of WebGL context to select
     ///
     /// Default: [`WebGlContextOption::BestFirst`].
     #[cfg(feature = "glow")]
@@ -434,18 +487,34 @@ pub struct WebOptions {
     #[cfg(feature = "wgpu")]
     pub wgpu_options: egui_wgpu::WgpuConfiguration,
 
-    /// The size limit of the web app canvas.
+    /// Controls whether to apply dithering to minimize banding artifacts.
     ///
-    /// By default the max size is [`egui::Vec2::INFINITY`], i.e. unlimited.
-    pub max_size_points: egui::Vec2,
+    /// Dithering assumes an sRGB output and thus will apply noise to any input value that lies between
+    /// two 8bit values after applying the sRGB OETF function, i.e. if it's not a whole 8bit value in "gamma space".
+    /// This means that only inputs from texture interpolation and vertex colors should be affected in practice.
+    ///
+    /// Defaults to true.
+    pub dithering: bool,
+
+    /// If the web event corresponding to an egui event should be propagated
+    /// to the rest of the web page.
+    ///
+    /// The default is `true`, meaning
+    /// [`stopPropagation`](https://developer.mozilla.org/en-US/docs/Web/API/Event/stopPropagation)
+    /// is called on every event, and the event is not propagated to the rest of the web page.
+    pub should_stop_propagation: Box<dyn Fn(&egui::Event) -> bool>,
+
+    /// Whether the web event corresponding to an egui event should have `prevent_default` called
+    /// on it or not.
+    ///
+    /// Defaults to true.
+    pub should_prevent_default: Box<dyn Fn(&egui::Event) -> bool>,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl Default for WebOptions {
     fn default() -> Self {
         Self {
-            follow_system_theme: true,
-            default_theme: Theme::Dark,
             depth_buffer: 0,
 
             #[cfg(feature = "glow")]
@@ -454,32 +523,10 @@ impl Default for WebOptions {
             #[cfg(feature = "wgpu")]
             wgpu_options: egui_wgpu::WgpuConfiguration::default(),
 
-            max_size_points: egui::Vec2::INFINITY,
-        }
-    }
-}
+            dithering: true,
 
-// ----------------------------------------------------------------------------
-
-/// Dark or Light theme.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub enum Theme {
-    /// Dark mode: light text on a dark background.
-    Dark,
-
-    /// Light mode: dark text on a light background.
-    Light,
-}
-
-impl Theme {
-    /// Get the egui visuals corresponding to this theme.
-    ///
-    /// Use with [`egui::Context::set_visuals`].
-    pub fn egui_visuals(self) -> egui::Visuals {
-        match self {
-            Self::Dark => egui::Visuals::dark(),
-            Self::Light => egui::Visuals::light(),
+            should_stop_propagation: Box::new(|_| true),
+            should_prevent_default: Box::new(|_| true),
         }
     }
 }
@@ -496,10 +543,10 @@ pub enum WebGlContextOption {
     /// Force use WebGL2.
     WebGl2,
 
-    /// Use WebGl2 first.
+    /// Use WebGL2 first.
     BestFirst,
 
-    /// Use WebGl1 first
+    /// Use WebGL1 first
     CompatibilityFirst,
 }
 
@@ -592,9 +639,15 @@ pub struct Frame {
     #[cfg(feature = "glow")]
     pub(crate) gl: Option<std::sync::Arc<glow::Context>>,
 
+    /// Used to convert user custom [`glow::Texture`] to [`egui::TextureId`]
+    #[cfg(all(feature = "glow", not(target_arch = "wasm32")))]
+    pub(crate) glow_register_native_texture:
+        Option<Box<dyn FnMut(glow::Texture) -> egui::TextureId>>,
+
     /// Can be used to manage GPU resources for custom rendering with WGPU using [`egui::PaintCallback`]s.
     #[cfg(feature = "wgpu")]
-    pub(crate) wgpu_render_state: Option<egui_wgpu::RenderState>,
+    #[doc(hidden)]
+    pub wgpu_render_state: Option<egui_wgpu::RenderState>,
 
     /// Raw platform window handle
     #[cfg(not(target_arch = "wasm32"))]
@@ -609,7 +662,7 @@ pub struct Frame {
 #[cfg(not(target_arch = "wasm32"))]
 assert_not_impl_any!(Frame: Clone);
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 #[cfg(not(target_arch = "wasm32"))]
 impl HasWindowHandle for Frame {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
@@ -618,7 +671,7 @@ impl HasWindowHandle for Frame {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 #[cfg(not(target_arch = "wasm32"))]
 impl HasDisplayHandle for Frame {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
@@ -628,10 +681,29 @@ impl HasDisplayHandle for Frame {
 }
 
 impl Frame {
+    /// Create a new empty [Frame] for testing [App]s in kittest.
+    #[doc(hidden)]
+    pub fn _new_kittest() -> Self {
+        Self {
+            #[cfg(feature = "glow")]
+            gl: None,
+            #[cfg(all(feature = "glow", not(target_arch = "wasm32")))]
+            glow_register_native_texture: None,
+            info: IntegrationInfo::mock(),
+            #[cfg(not(target_arch = "wasm32"))]
+            raw_display_handle: Err(HandleError::NotSupported),
+            #[cfg(not(target_arch = "wasm32"))]
+            raw_window_handle: Err(HandleError::NotSupported),
+            storage: None,
+            #[cfg(feature = "wgpu")]
+            wgpu_render_state: None,
+        }
+    }
+
     /// True if you are in a web environment.
     ///
     /// Equivalent to `cfg!(target_arch = "wasm32")`
-    #[allow(clippy::unused_self)]
+    #[expect(clippy::unused_self)]
     pub fn is_web(&self) -> bool {
         cfg!(target_arch = "wasm32")
     }
@@ -668,6 +740,15 @@ impl Frame {
         self.gl.as_ref()
     }
 
+    /// Register your own [`glow::Texture`],
+    /// and then you can use the returned [`egui::TextureId`] to render your texture with [`egui`].
+    ///
+    /// This function will take the ownership of your [`glow::Texture`], so please do not delete your [`glow::Texture`] after registering.
+    #[cfg(all(feature = "glow", not(target_arch = "wasm32")))]
+    pub fn register_native_glow_texture(&mut self, native: glow::Texture) -> egui::TextureId {
+        self.glow_register_native_texture.as_mut().unwrap()(native)
+    }
+
     /// The underlying WGPU render state.
     ///
     /// Only available when compiling with the `wgpu` feature and using [`Renderer::Wgpu`].
@@ -696,7 +777,7 @@ pub struct WebInfo {
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug)]
 pub struct Location {
-    /// The full URL (`location.href`) without the hash.
+    /// The full URL (`location.href`) without the hash, percent-decoded.
     ///
     /// Example: `"http://www.example.com:80/index.html?foo=bar"`.
     pub url: String,
@@ -736,8 +817,8 @@ pub struct Location {
 
     /// The parsed "query" part of "www.example.com/index.html?query#fragment".
     ///
-    /// "foo=42&bar%20" is parsed as `{"foo": "42",  "bar ": ""}`
-    pub query_map: std::collections::BTreeMap<String, String>,
+    /// "foo=hello&bar%20&foo=world" is parsed as `{"bar ": [""], "foo": ["hello", "world"]}`
+    pub query_map: std::collections::BTreeMap<String, Vec<String>>,
 
     /// `location.origin`
     ///
@@ -752,20 +833,37 @@ pub struct IntegrationInfo {
     #[cfg(target_arch = "wasm32")]
     pub web_info: WebInfo,
 
-    /// Does the OS use dark or light mode?
-    ///
-    /// `None` means "don't know".
-    pub system_theme: Option<Theme>,
-
     /// Seconds of cpu usage (in seconds) on the previous frame.
     ///
     /// This includes [`App::update`] as well as rendering (except for vsync waiting).
     ///
-    /// For a more detailed view of cpu usage, use the [`puffin`](https://crates.io/crates/puffin)
-    /// profiler together with the `puffin` feature of `eframe`.
+    /// For a more detailed view of cpu usage, connect your preferred profiler by enabling it's feature in [`profiling`](https://crates.io/crates/profiling).
     ///
     /// `None` if this is the first frame.
     pub cpu_usage: Option<f32>,
+}
+
+impl IntegrationInfo {
+    fn mock() -> Self {
+        Self {
+            #[cfg(target_arch = "wasm32")]
+            web_info: WebInfo {
+                user_agent: "kittest".to_owned(),
+                location: Location {
+                    url: "http://localhost".to_owned(),
+                    protocol: "http:".to_owned(),
+                    host: "localhost".to_owned(),
+                    hostname: "localhost".to_owned(),
+                    port: "80".to_owned(),
+                    hash: String::new(),
+                    query: String::new(),
+                    query_map: Default::default(),
+                    origin: "http://localhost".to_owned(),
+                },
+            },
+            cpu_usage: None,
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -787,24 +885,10 @@ pub trait Storage {
     fn flush(&mut self);
 }
 
-/// Stores nothing.
-#[derive(Clone, Default)]
-pub(crate) struct DummyStorage {}
-
-impl Storage for DummyStorage {
-    fn get_string(&self, _key: &str) -> Option<String> {
-        None
-    }
-
-    fn set_string(&mut self, _key: &str, _value: String) {}
-
-    fn flush(&mut self) {}
-}
-
 /// Get and deserialize the [RON](https://github.com/ron-rs/ron) stored at the given key.
 #[cfg(feature = "ron")]
 pub fn get_value<T: serde::de::DeserializeOwned>(storage: &dyn Storage, key: &str) -> Option<T> {
-    crate::profile_function!(key);
+    profiling::function_scope!(key);
     storage
         .get_string(key)
         .and_then(|value| match ron::from_str(&value) {
@@ -820,7 +904,7 @@ pub fn get_value<T: serde::de::DeserializeOwned>(storage: &dyn Storage, key: &st
 /// Serialize the given value as [RON](https://github.com/ron-rs/ron) and store with the given key.
 #[cfg(feature = "ron")]
 pub fn set_value<T: serde::Serialize>(storage: &mut dyn Storage, key: &str, value: &T) {
-    crate::profile_function!(key);
+    profiling::function_scope!(key);
     match ron::ser::to_string(value) {
         Ok(string) => storage.set_string(key, string),
         Err(err) => log::error!("eframe failed to encode data using ron: {}", err),

@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::sync::Arc;
 
 use eframe::egui_glow;
@@ -78,7 +80,7 @@ struct RotatingTriangle {
     vertex_array: glow::VertexArray,
 }
 
-#[allow(unsafe_code)] // we need unsafe code to use glow
+#[expect(unsafe_code)] // we need unsafe code to use glow
 impl RotatingTriangle {
     fn new(gl: &glow::Context) -> Option<Self> {
         use glow::HasContext as _;

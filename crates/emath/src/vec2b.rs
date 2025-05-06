@@ -1,3 +1,5 @@
+use crate::Vec2;
+
 /// Two bools, one for each axis (X and Y).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -18,6 +20,36 @@ impl Vec2b {
     #[inline]
     pub fn any(&self) -> bool {
         self.x || self.y
+    }
+
+    /// Are both `x` and `y` true?
+    #[inline]
+    pub fn all(&self) -> bool {
+        self.x && self.y
+    }
+
+    #[inline]
+    pub fn and(&self, other: impl Into<Self>) -> Self {
+        let other = other.into();
+        Self {
+            x: self.x && other.x,
+            y: self.y && other.y,
+        }
+    }
+
+    #[inline]
+    pub fn or(&self, other: impl Into<Self>) -> Self {
+        let other = other.into();
+        Self {
+            x: self.x || other.x,
+            y: self.y || other.y,
+        }
+    }
+
+    /// Convert to a float `Vec2` where the components are 1.0 for `true` and 0.0 for `false`.
+    #[inline]
+    pub fn to_vec2(self) -> Vec2 {
+        Vec2::new(self.x.into(), self.y.into())
     }
 }
 
